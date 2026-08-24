@@ -1,6 +1,10 @@
+import time
 import httpx
 
 ALPHA_EXCHANGE_INFO_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/get-exchange-info"
+_CACHE = set()
+_CACHE_AT = 0.0
+CACHE_SECONDS = 30
 
 
 def _extract_symbols(payload):
@@ -17,12 +21,18 @@ def _extract_symbols(payload):
 
 
 def fetch_active_alpha_ids(timeout=8.0):
-    """Return the Alpha IDs that are actually present in Alpha exchange info.
+    """Return Alpha IDs that currently exist in Alpha exchange-info.
 
-    The token-list endpoint can contain historical/offline tokens. Exchange info is
-    the authoritative market-symbol list for tokens that currently have an Alpha
-    trading pair, so the dashboard uses its intersection with the token list.
+    Binance's token-list endpoint contains token metadata, including historical
+    and offline entries. The Alpha exchange-info endpoint describes actual
+    Alpha trading symbols, so it is used as the authoritative active-market
+    filter. The result is cached briefly to avoid a request on every dashboard
+    refresh.
     """
+    global _CACHE, _CACHE_AT
+    now = time.time()
+    if _CACHE and now - _CACHE_AT < CACHE_SECONDS:
+        return set(_CACHE)
     try:
         r = httpx.get(
             ALPHA_EXCHANGE_INFO_URL,
@@ -42,7 +52,14 @@ def fetch_active_alpha_ids(timeout=8.0):
                 continue
             for candidate in (symbol, base):
                 if candidate.startswith("ALPHA_"):
-                    active.add(candidate.split("USDT")[0].split("USDC")[0].split("BNB")[0])
-        return active
+                    for suffix in ("USDT", "USDC", "BNB"):
+                        if candidate.endswith(suffix):
+                            candidate = candidate[:-len(suffix)]
+                            break
+                    active.add(candidate)
+        if active:
+            _CACHE = active
+            _CACHE_AT = now
+        return set(active)
     except Exception:
-        return set()
+        return set(_CACHE)
