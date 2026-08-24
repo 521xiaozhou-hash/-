@@ -1,27 +1,51 @@
 import asyncio
 import json
-import os
 import time
 import types
 import httpx
 import websockets
 
 # Binance Alpha official WebSocket market-data endpoint.
-# Use the official ALL book-ticker stream so every Alpha market is covered
-# by one real-time feed. REST is used ONLY as an initial snapshot bootstrap;
-# it is never used as a periodic/fallback live-price source.
+# !bookTicker is the live source of best bid/ask. REST fullDepth is used only
+# once after a connection is established so symbols that have not emitted a
+# bookTicker update yet still have an initial quote. It is never polled later.
 ALPHA_WS = "wss://nbstream.binance.com/w3w/wsa/stream"
 ALPHA_DEPTH_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/fullDepth"
 
 
+def _best_bid_ask(data):
+    """Return the actual best prices, independent of array ordering."""
+    bids = data.get("bids") if isinstance(data, dict) else None
+    asks = data.get("asks") if isinstance(data, dict) else None
+    bid_levels = []
+    ask_levels = []
+    for level in bids or []:
+        try:
+            p = float(level[0])
+            q = float(level[1]) if len(level) > 1 else None
+            if p > 0:
+                bid_levels.append((p, q))
+        except Exception:
+            continue
+    for level in asks or []:
+        try:
+            p = float(level[0])
+            q = float(level[1]) if len(level) > 1 else None
+            if p > 0:
+                ask_levels.append((p, q))
+        except Exception:
+            continue
+    # Best bid is the highest bid; best ask is the lowest ask.
+    bid = max(bid_levels, key=lambda x: x[0]) if bid_levels else None
+    ask = min(ask_levels, key=lambda x: x[0]) if ask_levels else None
+    if not bid or not ask or bid[0] > ask[0]:
+        return None
+    return bid[0], ask[0], bid[1], ask[1]
+
+
 def install_alpha_ws(engine):
     async def _bootstrap(self, symbols):
-        """Bootstrap the current top-of-book once after a WS connection starts.
-
-        This prevents an illiquid symbol from staying blank merely because its
-        bookTicker stream has not emitted a change yet. After bootstrap, only
-        the WebSocket stream updates the quote; there is no periodic REST poll.
-        """
+        """Take one initial full-depth snapshot; live quotes come from WS only."""
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json, text/plain, */*",
@@ -33,21 +57,19 @@ def install_alpha_ws(engine):
             async def one(symbol):
                 async with sem:
                     try:
-                        r = await client.get(ALPHA_DEPTH_URL, params={"symbol": symbol, "limit": 5})
+                        r = await client.get(ALPHA_DEPTH_URL, params={"symbol": symbol, "limit": 20})
                         r.raise_for_status()
                         d = r.json()
                         x = d.get("data") if isinstance(d, dict) else None
-                        bids = x.get("bids") if isinstance(x, dict) else None
-                        asks = x.get("asks") if isinstance(x, dict) else None
-                        bid = float(bids[0][0]) if bids else None
-                        ask = float(asks[0][0]) if asks else None
-                        if bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask:
+                        best = _best_bid_ask(x)
+                        if not best:
                             return None
+                        bid, ask, bid_qty, ask_qty = best
                         return symbol, {
                             "bid": bid,
                             "ask": ask,
-                            "bid_qty": float(bids[0][1]) if bids and len(bids[0]) > 1 else None,
-                            "ask_qty": float(asks[0][1]) if asks and len(asks[0]) > 1 else None,
+                            "bid_qty": bid_qty,
+                            "ask_qty": ask_qty,
                             "last": (bid + ask) / 2,
                             "ts": int((x or {}).get("E") or time.time() * 1000),
                             "source": "bootstrap",
@@ -96,30 +118,30 @@ def install_alpha_ws(engine):
                     close_timeout=5,
                 ) as ws:
                     self.connections["Binance Alpha"] = "connected"
+                    self.alpha_diag["ws_subscribed"] = False
+                    self.alpha_diag["ws_updates"] = 0
 
-                    # One official all-market stream. No per-symbol subscription fan-out.
                     await ws.send(json.dumps({
                         "method": "SUBSCRIBE",
                         "params": ["!bookTicker"],
                         "id": "alpha-all-bookticker",
                     }))
 
-                    # Bootstrap only once. Live quotes thereafter come exclusively
-                    # from WebSocket messages.
+                    # Initial snapshot only. After this point, do not replace live
+                    # quotes with periodic REST responses.
                     await self._alpha_bootstrap(symbols)
 
-                    last_activity = time.monotonic()
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         except asyncio.TimeoutError:
-                            # Keep the socket alive and rebuild if Alpha's market list changed.
-                            await ws.send(json.dumps({"method": "LIST_SUBSCRIPTION", "id": "alpha-list"}))
-                            if tuple(sorted({
-                                str(x.get("market_symbol") or "").upper()
-                                for x in self.alpha
-                                if x.get("market_symbol")
-                            })) != signature:
+                            async with self.lock:
+                                current = tuple(sorted({
+                                    str(x.get("market_symbol") or "").upper()
+                                    for x in self.alpha
+                                    if x.get("market_symbol")
+                                }))
+                            if current != signature:
                                 return
                             continue
 
@@ -128,12 +150,10 @@ def install_alpha_ws(engine):
                         except Exception:
                             continue
 
-                        # Subscription acknowledgement / diagnostics.
                         if msg.get("id") == "alpha-all-bookticker":
-                            if msg.get("result") is None:
-                                self.alpha_diag["ws_subscribed"] = True
-                            else:
-                                self.alpha_diag["ws_subscribed"] = False
+                            ok = msg.get("result") is None
+                            self.alpha_diag["ws_subscribed"] = ok
+                            if not ok:
                                 self.alpha_diag["error"] = str(msg.get("result"))
                             continue
 
@@ -163,6 +183,10 @@ def install_alpha_ws(engine):
                             "source": "websocket",
                         }
                         async with self.lock:
+                            old = self.alpha_quotes.get(symbol)
+                            # Never allow an older WS event to overwrite a newer quote.
+                            if old and ts < int(old.get("ts") or 0):
+                                continue
                             self.alpha_quotes[symbol] = q
                             for row in self.alpha:
                                 if row.get("market_symbol") == symbol:
@@ -172,7 +196,7 @@ def install_alpha_ws(engine):
                             self.alpha_diag["book_quotes"] = sum(
                                 1 for row in self.alpha if self.alpha_quotes.get(row.get("market_symbol"))
                             )
-                        last_activity = time.monotonic()
+                            self.alpha_diag["ws_updates"] = int(self.alpha_diag.get("ws_updates") or 0) + 1
 
             except asyncio.CancelledError:
                 raise
