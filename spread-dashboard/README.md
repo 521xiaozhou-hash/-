@@ -1,47 +1,51 @@
 # 跨交易所价差监控
 
-一个可直接部署到 Linux 的 FastAPI + 单页 Web Dashboard，用于监控：
+这个版本把**行情链路完全放在你的 Linux 服务器上**：浏览器只访问服务器自己的 `/api/data`，服务器后台连接 Binance Alpha / Binance RWA bStocks / Bybit / Gate / OKX / Coinbase。GitHub 只用于程序版本与 OTA 更新，不参与行情请求。
 
-- Binance bStocks（由 `BSTOCK_SYMBOLS` 指定的 Binance 现货交易对）
-- Binance Alpha 与 Bybit / Gate / OKX / Coinbase 的价格及百分比价差
+## 当前架构
 
-> 注意：不同平台的 Alpha、代币化股票产品和交易对命名可能变化。程序不会硬编码不存在的市场；如果 Binance Alpha 公共接口返回结构变化，页面会显示当前可获得的数据或 `—`。
+- Binance Alpha：服务器定期同步 Alpha token list，并用服务器本地缓存作为监控币种清单。
+- Bybit / Gate / OKX / Coinbase：服务器后台 WebSocket 实时接收行情并缓存。
+- Binance bStocks：服务器定期同步 Binance RWA 股票 token 信息与价格。
+- 浏览器：每秒最多请求一次服务器 `/api/data`，不会直接访问交易所或 GitHub。
+- OTA：GitHub 仅用于程序更新；网页的「程序更新」按钮可触发服务器更新。
 
-## Linux 一键安装
+Bybit Spot ticker 官方推送频率为 50ms；Gate 的 book ticker 可到 10ms；OKX 与 Coinbase 都提供公开 WebSocket ticker，因此服务器侧 WebSocket 比浏览器轮询交易所 REST 更适合低延迟监控。具体实际延迟仍取决于服务器到交易所的网络质量。 
+
+## Linux 安装
+
+第一次部署完成后，后续程序更新不需要重新连接服务器。安装脚本会创建运行环境、systemd 服务和 OTA 更新机制。
 
 ```bash
-git clone https://github.com/521xiaozhou-hash/-\ncd -/spread-dashboard
-bash install.sh
-source .venv/bin/activate
-python app.py
+curl -fsSL https://raw.githubusercontent.com/521xiaozhou-hash/-/main/install.sh | bash
 ```
 
-然后打开 `http://服务器IP:8080`。
+然后访问 `http://服务器IP:8080`。
 
 ## 配置
 
-首次安装会生成 `.env`。常用配置：
-
 ```env
 PORT=8080
-REFRESH_SECONDS=10
-REQUEST_TIMEOUT=8
+REQUEST_TIMEOUT=6
+ALPHA_REFRESH_SECONDS=60
+BSTOCK_REFRESH_SECONDS=5
 ALPHA_SYMBOLS=
-BSTOCK_SYMBOLS=AAPLUSDT,TSLAUSDT,NVDAUSDT,MSTRUSDT
+BSTOCK_TICKERS=AAPL,TSLA,NVDA,MSTR
+UPDATE_CHECK_SECONDS=15
 ```
 
-`ALPHA_SYMBOLS` 留空时尝试自动发现 Binance Alpha 返回的币种；也可以手工指定。
+`ALPHA_SYMBOLS` 留空表示监控 Binance Alpha token list 中服务器能够识别的全部 Alpha 币种。
 
-## 价差定义
+## OTA 更新
 
-页面显示：
+网页右上角的「⚙ 程序更新」只负责**程序更新**，不是行情更新。服务器会从 GitHub 拉取新代码、安装新依赖并重启程序。行情数据不会从 GitHub 获取。
 
-`Alpha 相对外部交易所价差 = (Alpha价格 / 外部交易所价格 - 1) × 100%`
+不要把 Binance/Gate/Bybit/OKX/Coinbase 私钥放进仓库；当前行情功能只使用公开市场数据接口。
 
-因此正数表示 Alpha 价格高于该交易所，负数表示低于该交易所。
+## 价差
 
-bStocks 部分显示 Binance 指定股票代币交易对的实时中间价；若需要严格比较真实美股现货价格，应额外接入股票基准数据源，不能把普通股票价格和链上/交易所代币价格直接混为一谈。
+当前页面显示：
 
-## 生产运行
+`Alpha 相对外部交易所最新价格价差 = (Alpha价格 / 外部价格 - 1) × 100%`
 
-建议用 systemd / Docker / nginx 管理进程。当前项目本身不需要 API Key，因为行情读取使用公开市场接口；不要把任何交易 API 私钥写进 `.env` 或 Git。
+下一步如果用于实际套利，建议改成基于外部交易所 best bid / best ask 的可成交价差，并扣除手续费、滑点和提现/充值成本。
