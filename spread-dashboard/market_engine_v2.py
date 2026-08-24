@@ -21,7 +21,7 @@ GATE_WS = "wss://api.gateio.ws/ws/v4/"
 OKX_WS = "wss://ws.okx.com:8443/ws/v5/public"
 COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
 
-ALPHA_REFRESH = int(os.getenv("ALPHA_REFRESH_SECONDS", "60"))
+ALPHA_REFRESH = int(os.getenv("ALPHA_REFRESH_SECONDS", "30"))
 ALPHA_DEPTH_REFRESH = int(os.getenv("ALPHA_DEPTH_REFRESH_SECONDS", "5"))
 BSTOCK_REFRESH = int(os.getenv("BSTOCK_REFRESH_SECONDS", "15"))
 HTTP_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
@@ -55,8 +55,9 @@ def quote(bid, ask, ts=None):
 
 
 def opportunity(a, b, aname, bname):
+    empty = {"buy_market": None, "sell_market": None, "spread": None, "buy_price": None, "sell_price": None}
     if not a or not b:
-        return {"buy_market": None, "sell_market": None, "spread": None, "buy_price": None, "sell_price": None}
+        return empty
     candidates = []
     s1 = pct(a.get("ask"), b.get("bid"))
     if s1 is not None:
@@ -64,7 +65,7 @@ def opportunity(a, b, aname, bname):
     s2 = pct(b.get("ask"), a.get("bid"))
     if s2 is not None:
         candidates.append({"buy_market": bname, "sell_market": aname, "spread": s2, "buy_price": b.get("ask"), "sell_price": a.get("bid")})
-    return max(candidates, key=lambda x: x["spread"], default={"buy_market": None, "sell_market": None, "spread": None, "buy_price": None, "sell_price": None})
+    return max(candidates, key=lambda x: x["spread"], default=empty)
 
 
 class MarketEngine:
@@ -79,6 +80,7 @@ class MarketEngine:
         self.binance_stocks = {}
         self.gate_stocks = {}
         self.connections = {x: "disconnected" for x in self.external}
+        self.connections["Binance Alpha"] = "disconnected"
         self.tasks = []
 
     def blacklist(self):
@@ -92,20 +94,21 @@ class MarketEngine:
         try:
             r = await client.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT, follow_redirects=True)
             r.raise_for_status()
-            data = r.json()
-            return data
+            return r.json()
         except Exception:
             return None
 
     @staticmethod
     def _alpha_items(payload):
+        if isinstance(payload, list):
+            return payload
         if not isinstance(payload, dict):
             return []
         data = payload.get("data")
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("data", "tokens", "list", "rows"):
+            for key in ("data", "tokens", "list", "rows", "items"):
                 if isinstance(data.get(key), list):
                     return data[key]
         return []
@@ -142,20 +145,22 @@ class MarketEngine:
                                 if symbol.endswith(q):
                                     base = symbol[:-len(q)]
                                     break
-                        if base.startswith("ALPHA_"):
+                        if base.startswith("ALPHA_") and symbol:
                             active[base] = symbol
+
                     meta = {str(x.get("alphaId") or "").upper(): x for x in token_items if isinstance(x, dict) and x.get("alphaId")}
                     blocked = self.blacklist()
                     rows = []
                     for aid, market_symbol in active.items():
                         x = meta.get(aid, {})
-                        coin = str(x.get("cexCoinName") or "").upper()
-                        display_coin = coin or str(x.get("symbol") or aid).upper()
+                        coin = str(x.get("cexCoinName") or x.get("symbol") or "").upper()
+                        display_coin = coin or aid
                         if aid in blocked or display_coin in blocked or norm(display_coin + "USDT") in blocked:
                             continue
                         if ALPHA_SYMBOLS and aid not in ALPHA_SYMBOLS and display_coin not in ALPHA_SYMBOLS and norm(display_coin + "USDT") not in ALPHA_SYMBOLS:
                             continue
                         rows.append({"alpha_id": aid, "market_symbol": market_symbol, "coin": display_coin, "cex_coin": coin, "price": None, "ts": int(time.time() * 1000)})
+
                     if not rows and not exchange_items:
                         for x in token_items:
                             if not isinstance(x, dict) or x.get("offline") or x.get("offsell"):
@@ -164,7 +169,8 @@ class MarketEngine:
                             coin = str(x.get("cexCoinName") or x.get("symbol") or "").upper()
                             if not aid or not coin or aid in blocked or coin in blocked:
                                 continue
-                            rows.append({"alpha_id": aid, "market_symbol": aid + "USDT", "coin": coin, "cex_coin": str(x.get("cexCoinName") or "").upper(), "price": None, "ts": int(time.time() * 1000)})
+                            rows.append({"alpha_id": aid, "market_symbol": aid + "USDT", "coin": coin, "cex_coin": coin, "price": None, "ts": int(time.time() * 1000)})
+
                     rows.sort(key=lambda x: x["coin"])
                     async with self.lock:
                         self.alpha = rows
@@ -196,7 +202,9 @@ class MarketEngine:
                                 return symbol, None
                     results = await asyncio.gather(*(one(s) for s in symbols))
                 async with self.lock:
-                    self.alpha_quotes = {s: q for s, q in results if q}
+                    for s, q in results:
+                        if q:
+                            self.alpha_quotes[s] = q
                     for x in self.alpha:
                         q = self.alpha_quotes.get(x["market_symbol"])
                         if q:
@@ -235,7 +243,7 @@ class MarketEngine:
                                 spot_map[s[:-4]] = quote(q.get("bidPrice"), q.get("askPrice"), q.get("time"))
                     async with self.lock:
                         self.bstocks = rows
-                        self.bstock_quotes = {r["ticker"]: spot_map.get(r["ticker"]) for r in rows}
+                        self.bstock_quotes = {r["ticker"]: spot_map.get(r["ticker"])}
                     await self.refresh_binance_stocks(c, [r["ticker"].removesuffix("B") for r in rows])
                     await self.refresh_gate_stocks(c, [r["ticker"].removesuffix("B") for r in rows])
             except Exception:
