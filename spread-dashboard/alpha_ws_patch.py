@@ -1,72 +1,122 @@
 import asyncio
 import json
+import math
+import os
 import time
 import types
-import httpx
 import websockets
 
+# Binance Alpha official WebSocket market-data endpoint.
+# Live prices use individual <symbol>@bookTicker streams in a parallel pool.
+# REST is intentionally NOT used as a live-price fallback.
 ALPHA_WS = "wss://nbstream.binance.com/w3w/wsa/stream"
-ALPHA_DEPTH_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/fullDepth"
+MAX_STREAMS_PER_CONNECTION = max(50, int(os.getenv("ALPHA_STREAMS_PER_CONNECTION", "200")))
 
 
 def install_alpha_ws(engine):
-    async def alpha_depth_stream(self):
-        while True:
-            try:
-                async with websockets.connect(ALPHA_WS, ping_interval=20, ping_timeout=10, max_size=32 * 1024 * 1024) as ws:
-                    self.connections["Binance Alpha"] = "connected"
-                    await ws.send(json.dumps({"method": "SUBSCRIBE", "params": ["!bookTicker"], "id": 1}))
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw); d = msg.get("data") or {}
-                            if not isinstance(d, dict) or d.get("e") != "bookTicker": continue
-                            symbol = str(d.get("s") or "").upper()
-                            bid = float(d.get("b")) if d.get("b") not in (None, "") else None
-                            ask = float(d.get("a")) if d.get("a") not in (None, "") else None
-                            if not symbol or bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask: continue
-                            q={"bid":bid,"ask":ask,"bid_qty":float(d.get("B")) if d.get("B") not in (None, "") else None,"ask_qty":float(d.get("A")) if d.get("A") not in (None, "") else None,"last":(bid+ask)/2,"ts":int(d.get("E") or d.get("T") or time.time()*1000)}
-                            async with self.lock:
-                                self.alpha_quotes[symbol]=q
-                                for row in self.alpha:
-                                    if row.get("market_symbol")==symbol:
-                                        row["price"]=q["last"]; row["ts"]=q["ts"]; break
-                        except Exception: continue
-            except Exception:
-                self.connections["Binance Alpha"]="reconnecting"; await asyncio.sleep(2)
-
-    async def seed_missing_alpha(self):
-        """REST only seeds missing/stale symbols; realtime updates continue via !bookTicker."""
-        while True:
-            try:
-                now=int(time.time()*1000)
-                async with self.lock:
-                    wanted=[r.get("market_symbol") for r in self.alpha if r.get("market_symbol")]
-                    missing=[s for s in wanted if not self.alpha_quotes.get(s) or now-int(self.alpha_quotes[s].get("ts",0))>120000]
-                batch=missing[:100]
-                if batch:
-                    async with httpx.AsyncClient(timeout=6,headers={"User-Agent":"Mozilla/5.0","Accept":"application/json","Referer":"https://www.binance.com/"}) as c:
-                        sem=asyncio.Semaphore(16)
-                        async def one(symbol):
-                            async with sem:
-                                try:
-                                    r=await c.get(ALPHA_DEPTH_URL,params={"symbol":symbol,"limit":5}); r.raise_for_status(); d=r.json(); x=d.get("data") or {}; bids=x.get("bids") or []; asks=x.get("asks") or []
-                                    bid=float(bids[0][0]) if bids else None; ask=float(asks[0][0]) if asks else None
-                                    if bid is None or ask is None or bid<=0 or ask<=0 or bid>ask: return symbol,None
-                                    return symbol,{"bid":bid,"ask":ask,"last":(bid+ask)/2,"ts":int(x.get("E") or now)}
-                                except Exception: return symbol,None
-                        results=await asyncio.gather(*(one(s) for s in batch))
+    async def _alpha_worker(self, symbols, shard_index, signature):
+        streams = [f"{s.lower()}@bookTicker" for s in symbols]
+        try:
+            async with websockets.connect(
+                ALPHA_WS,
+                ping_interval=20,
+                ping_timeout=10,
+                max_size=16 * 1024 * 1024,
+                close_timeout=5,
+            ) as ws:
+                self.connections["Binance Alpha"] = "connected"
+                await ws.send(json.dumps({"method": "SUBSCRIBE", "params": streams, "id": shard_index + 1}))
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                    except asyncio.TimeoutError:
+                        async with self.lock:
+                            current = tuple(x.get("market_symbol") for x in self.alpha if x.get("market_symbol"))
+                        if current != signature:
+                            return
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    data = msg.get("data") if isinstance(msg, dict) else None
+                    if not isinstance(data, dict) or data.get("e") != "bookTicker":
+                        continue
+                    symbol = str(data.get("s") or "").upper()
+                    try:
+                        bid = float(data.get("b")) if data.get("b") not in (None, "") else None
+                        ask = float(data.get("a")) if data.get("a") not in (None, "") else None
+                    except Exception:
+                        continue
+                    if not symbol or bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask:
+                        continue
+                    ts = int(data.get("E") or data.get("T") or time.time() * 1000)
+                    q = {
+                        "bid": bid,
+                        "ask": ask,
+                        "bid_qty": float(data.get("B")) if data.get("B") not in (None, "") else None,
+                        "ask_qty": float(data.get("A")) if data.get("A") not in (None, "") else None,
+                        "last": (bid + ask) / 2,
+                        "ts": ts,
+                    }
                     async with self.lock:
-                        for s,q in results:
-                            if q:
-                                self.alpha_quotes[s]=q
-                                for row in self.alpha:
-                                    if row.get("market_symbol")==s:
-                                        row["price"]=q["last"]; row["ts"]=q["ts"]; break
-                        self.alpha_diag["book_quotes"]=sum(1 for r in self.alpha if self.alpha_quotes.get(r.get("market_symbol")))
-            except Exception: pass
-            await asyncio.sleep(10)
+                        self.alpha_quotes[symbol] = q
+                        for row in self.alpha:
+                            if row.get("market_symbol") == symbol:
+                                row["price"] = q["last"]
+                                row["ts"] = q["ts"]
+                                break
+                        self.alpha_diag["book_quotes"] = sum(
+                            1 for row in self.alpha if self.alpha_quotes.get(row.get("market_symbol"))
+                        )
+        except Exception:
+            self.connections["Binance Alpha"] = "reconnecting"
+            raise
 
-    engine.connections["Binance Alpha"]="disconnected"
-    engine.refresh_alpha_depth=types.MethodType(alpha_depth_stream,engine)
-    engine.seed_missing_alpha=types.MethodType(seed_missing_alpha,engine)
+    async def alpha_realtime_pool(self):
+        """Subscribe to every active Alpha market in parallel via realtime bookTicker.
+
+        There is no REST polling for live prices. Symbols are sharded across multiple
+        WebSocket connections; when Alpha's symbol list changes, the pool is rebuilt.
+        """
+        while True:
+            try:
+                async with self.lock:
+                    symbols = sorted({
+                        str(x.get("market_symbol") or "").upper()
+                        for x in self.alpha
+                        if x.get("market_symbol")
+                    })
+                if not symbols:
+                    self.connections["Binance Alpha"] = "waiting-alpha"
+                    await asyncio.sleep(1)
+                    continue
+
+                signature = tuple(symbols)
+                shard_count = max(1, math.ceil(len(symbols) / MAX_STREAMS_PER_CONNECTION))
+                shards = [
+                    symbols[i * MAX_STREAMS_PER_CONNECTION:(i + 1) * MAX_STREAMS_PER_CONNECTION]
+                    for i in range(shard_count)
+                ]
+                workers = [
+                    asyncio.create_task(self._alpha_worker(shard, i, signature))
+                    for i, shard in enumerate(shards)
+                ]
+                try:
+                    await asyncio.gather(*workers)
+                except Exception:
+                    pass
+                finally:
+                    for task in workers:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.connections["Binance Alpha"] = "reconnecting"
+                await asyncio.sleep(1)
+
+    engine.connections["Binance Alpha"] = "disconnected"
+    engine.refresh_alpha_depth = types.MethodType(alpha_realtime_pool, engine)
     return engine
